@@ -1,18 +1,25 @@
 extends RefCounted
 ## Procedural, seeded arenas. Every peer builds the identical layout from the arena id.
 const Meshes := preload("res://scripts/meshes.gd")
-const NAMES := ["Deep Space", "Star Surface", "Ocean", "Desert", "Tech Planet"]
+const NAMES := ["Deep Space", "Star Surface", "Ocean", "Desert", "Tech Planet", "Circuit Yard (top-down)", "Ember Basin (top-down)", "Bastion Line (top-down)"]
+const FIRST_TOPDOWN := 5
 
 static func build(w: Node3D, id: int) -> Dictionary:
 	var cfg := {"id": id, "name": NAMES[id], "planet": id != 0, "gravity": 0.0 if id == 0 else 7.0,
 		"radius": 600.0, "ceil": 400.0, "spawn_min": 0.0, "spawn_max": 0.0,
-		"hazard": "", "hazard_y": -INF, "flares": []}
+		"hazard": "", "hazard_y": -INF, "flares": [], "topdown": id >= FIRST_TOPDOWN, "plane_y": PLANE_Y}
+	if cfg["topdown"]:
+		cfg["gravity"] = 0.0
+		cfg["radius"] = 320.0
 	match id:
 		0: _space(w, cfg)
 		1: _star(w, cfg)
 		2: _ocean(w, cfg)
 		3: _desert(w, cfg)
 		4: _tech(w, cfg)
+		5: _grid_td(w, cfg)
+		6: _ember_td(w, cfg)
+		7: _bastion_td(w, cfg)
 	return cfg
 
 # ------------------------------------------------------------ helpers
@@ -395,3 +402,171 @@ static func _tech(w: Node3D, cfg: Dictionary) -> void:
 		caps.add(Vector3(p.x, 40 + 203, p.y), Vector3(8, 6, 8), Color(1.0, 0.15, 0.15), false)
 	glow.finish(w)
 	caps.finish(w, true)
+
+# ------------------------------------------------------------ 5 / 6 top-down arenas (play locked to the plane y = PLANE_Y)
+const PLANE_Y := 30.0
+const TD_GRID_SHADER := """
+shader_type spatial;
+render_mode unshaded;
+void fragment(){
+	vec2 g = abs(fract(UV * 64.0) - 0.5);
+	float l = smoothstep(0.47, 0.5, max(g.x, g.y));
+	ALBEDO = mix(vec3(0.02, 0.03, 0.08), vec3(0.1, 0.9, 1.0), l);
+}
+"""
+
+static func _grid_td(w: Node3D, cfg: Dictionary) -> void:
+	cfg["spawn_min"] = PLANE_Y
+	cfg["spawn_max"] = PLANE_Y
+	cfg["ceil"] = PLANE_Y + 5.0
+	_env(w, Color(0.02, 0.01, 0.05), Color(0.35, 0.38, 0.6), 0.8, Color(0.6, 0.75, 1.0), 1.1, Vector3(-65, 30, 0))
+	_floor_plane(w, 0.0)
+	var grid_plane := _shader_plane(w, 800.0, 1, TD_GRID_SHADER, 0.05)
+	grid_plane.position.y = 0.05
+	
+	var pillar_rng := RandomNumberGenerator.new()
+	pillar_rng.seed = 6006
+	var pillar_batch := BoxBatch.new()
+	var cap_batch := BoxBatch.new()
+	
+	for i in range(16):
+		var angle := float(i) / 16.0 * TAU
+		var r := 140.0 + _rand_xz(pillar_rng, 20.0).x
+		var pos := Vector3(cos(angle) * r, PLANE_Y, sin(angle) * r)
+		var size := Vector3(12.0 + _rand_xz(pillar_rng, 10.0).x, 60.0, 12.0 + _rand_xz(pillar_rng, 10.0).x)
+		pillar_batch.add(pos, size, Color(0.22, 0.24, 0.36), true)
+		cap_batch.add(pos + Vector3.UP * 30.0, Vector3.ONE * 12.0, Color(0.2, 1.0, 0.9), false)
+	
+	for i in range(6):
+		var angle := float(i) / 6.0 * TAU
+		var r := 240.0 + _rand_xz(pillar_rng, 20.0).x
+		var pos := Vector3(cos(angle) * r, PLANE_Y, sin(angle) * r)
+		var size := Vector3(12.0 + _rand_xz(pillar_rng, 10.0).x, 60.0, 12.0 + _rand_xz(pillar_rng, 10.0).x)
+		pillar_batch.add(pos, size, Color(0.22, 0.24, 0.36), true)
+		cap_batch.add(pos + Vector3.UP * 30.0, Vector3.ONE * 12.0, Color(0.2, 1.0, 0.9), false)
+	
+	pillar_batch.finish(w)
+	cap_batch.finish(w, true)
+	
+	var wall_batch := BoxBatch.new()
+	var l_size := Vector3(4.0, 60.0, 40.0 + _rand_xz(pillar_rng, 30.0).x)
+	var l_pos1 := Vector3(200.0, PLANE_Y, 200.0)
+	wall_batch.add(l_pos1, l_size, Color(0.15, 0.15, 0.2), true)
+	wall_batch.add(l_pos1 + Vector3(-l_size.z, 0, 0), Vector3(l_size.z, 60.0, 4.0), Color(0.15, 0.15, 0.2), true)
+	
+	var l_pos2 := Vector3(-200.0, PLANE_Y, 200.0)
+	wall_batch.add(l_pos2, l_size, Color(0.15, 0.15, 0.2), true)
+	wall_batch.add(l_pos2 + Vector3(l_size.z, 0, 0), Vector3(l_size.z, 60.0, 4.0), Color(0.15, 0.15, 0.2), true)
+	
+	var l_size2 := Vector3(40.0 + _rand_xz(pillar_rng, 30.0).x, 60.0, 4.0)
+	var l_pos3 := Vector3(200.0, PLANE_Y, -200.0)
+	wall_batch.add(l_pos3, l_size2, Color(0.15, 0.15, 0.2), true)
+	wall_batch.add(l_pos3 + Vector3(0, 0, -l_size.x), Vector3(4.0, 60.0, l_size.x), Color(0.15, 0.15, 0.2), true)
+	
+	var l_pos4 := Vector3(-200.0, PLANE_Y, -200.0)
+	wall_batch.add(l_pos4, l_size2, Color(0.15, 0.15, 0.2), true)
+	wall_batch.add(l_pos4 + Vector3(0, 0, l_size.x), Vector3(4.0, 60.0, l_size.x), Color(0.15, 0.15, 0.2), true)
+	wall_batch.finish(w)
+	
+	var post_batch := BoxBatch.new()
+	for i in range(48):
+		var angle := float(i) / 48.0 * TAU
+		var pos := Vector3(cos(angle) * 330.0, PLANE_Y, sin(angle) * 330.0)
+		post_batch.add(pos, Vector3(4.0, 60.0, 4.0), Color(0.3, 0.4, 0.5), true)
+	post_batch.finish(w)
+
+static func _ember_td(w: Node3D, cfg: Dictionary) -> void:
+	cfg["spawn_min"] = PLANE_Y
+	cfg["spawn_max"] = PLANE_Y
+	cfg["ceil"] = PLANE_Y + 5.0
+	_env(w, Color(0.08, 0.02, 0.0), Color(0.55, 0.3, 0.22), 0.8, Color(1.0, 0.55, 0.3), 1.3, Vector3(-60, -35, 0), Color(0.25, 0.08, 0.03), 0.0012)
+	_floor_plane(w, 0.0)
+	
+	var slab_batch := BoxBatch.new()
+	slab_batch.add(Vector3.ZERO, Vector3(700.0, 2.0, 700.0), Color(0.18, 0.1, 0.08), false)
+	slab_batch.finish(w)
+	
+	var col_rng := RandomNumberGenerator.new()
+	col_rng.seed = 7007
+	var col_batch := BoxBatch.new()
+	var lava_batch := BoxBatch.new()
+	
+	for i in range(26):
+		var pos2d := _rand_xz(col_rng, 290.0)
+		if pos2d.length() < 25.0: continue
+		var pos := Vector3(pos2d.x, 0.0, pos2d.y)
+		var size := Vector3(col_rng.randf_range(10.0, 26.0), col_rng.randf_range(55.0, 75.0), col_rng.randf_range(10.0, 26.0))
+		pos.y = size.y * 0.5
+		col_batch.add(pos, size, Color(0.05, 0.04, 0.04), true)
+	
+	for i in range(8):
+		var pos2d := _rand_xz(col_rng, 290.0)
+		if pos2d.length() < 25.0: continue
+		var pos := Vector3(pos2d.x, PLANE_Y, pos2d.y)
+		var r := 14.0 + _rand_xz(col_rng, 10.0).x
+		var mesh := Meshes.icosphere(r, 0.1, col_rng, Color(0.3, 0.16, 0.1))
+		var node := StaticBody3D.new()
+		node.collision_layer = 1
+		var shape := SphereShape3D.new()
+		shape.radius = r * 0.92
+		node.shape_owner_add_shape(node.create_shape_owner(shape), shape)
+		var mi := MeshInstance3D.new()
+		mi.mesh = mesh
+		node.add_child(mi)
+		node.position = pos
+		w.add_child(node)
+		w.rocks.append([mi, Vector3(_rand_xz(col_rng, 0.5).x, _rand_xz(col_rng, 0.5).x, _rand_xz(col_rng, 0.5).x)])
+	
+	for i in range(10):
+		var pos2d := _rand_xz(col_rng, 290.0)
+		if pos2d.length() < 25.0: continue
+		var pos := Vector3(pos2d.x, 0.3, pos2d.y)
+		var size := Vector3(40.0 + _rand_xz(col_rng, 50.0).x, 0.4, 2.0 + _rand_xz(col_rng, 2.0).x)
+		lava_batch.add(pos, size, Color(1.0, 0.35, 0.05), false)
+	
+	col_batch.finish(w)
+	lava_batch.finish(w, true)
+# ------------------------------------------------------------ 7 bastion line (top-down)
+## A long steel deck: the defended line runs along +Z (the south edge), bunker rows give cover
+## in the middle band, and the north half is open ground the marching formations cross.
+static func _bastion_td(w: Node3D, cfg: Dictionary) -> void:
+	cfg["spawn_min"] = PLANE_Y
+	cfg["spawn_max"] = PLANE_Y
+	cfg["ceil"] = PLANE_Y + 5.0
+	_env(w, Color(0.03, 0.04, 0.07), Color(0.4, 0.45, 0.55), 0.85, Color(0.9, 0.95, 1.0), 1.2, Vector3(-70, 20, 0))
+	_floor_plane(w, 0.0)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 8008
+	var deck := BoxBatch.new()
+	for ix in range(-7, 8):
+		for iz in range(-7, 8):
+			var c := Color(0.16, 0.18, 0.22) if (ix + iz) % 2 == 0 else Color(0.13, 0.15, 0.19)
+			deck.add(Vector3(ix * 46.0, -0.5, iz * 46.0), Vector3(45.0, 1.0, 45.0), c, false)
+	deck.finish(w)
+	# the defended line: a glowing strip near the south edge
+	var line := BoxBatch.new()
+	line.add(Vector3(0, 0.2, 280.0), Vector3(560.0, 0.4, 3.0), Color(1.0, 0.3, 0.2), false)
+	for i in range(-6, 7):
+		line.add(Vector3(i * 44.0, 0.3, 288.0), Vector3(14.0, 0.5, 1.2), Color(1.0, 0.8, 0.2), false)
+	line.finish(w, true)
+	# bunker rows across the middle band, with gaps to fly through
+	var bunk := BoxBatch.new()
+	for row in 2:
+		var z := 60.0 + row * 90.0
+		for i in range(-4, 5):
+			if rng.randf() < 0.3: continue
+			var x := i * 62.0 + rng.randf_range(-8.0, 8.0) + (31.0 if row == 1 else 0.0)
+			var size := Vector3(rng.randf_range(16.0, 26.0), 60.0, rng.randf_range(8.0, 12.0))
+			bunk.add(Vector3(x, size.y * 0.5, z), size, Color(0.28, 0.3, 0.34), true)
+	bunk.finish(w)
+	# warning lights on the bunkers' line, and a perimeter ring of posts
+	var posts := BoxBatch.new()
+	for i in range(48):
+		var a := float(i) / 48.0 * TAU
+		posts.add(Vector3(cos(a) * 330.0, 30.0, sin(a) * 330.0), Vector3(4.0, 60.0, 4.0), Color(0.35, 0.38, 0.45), true)
+	posts.finish(w)
+	var lights := BoxBatch.new()
+	for i in range(48):
+		var a := float(i) / 48.0 * TAU
+		lights.add(Vector3(cos(a) * 330.0, 61.0, sin(a) * 330.0), Vector3(5.0, 2.0, 5.0), Color(0.3, 0.9, 1.0), false)
+	lights.finish(w, true)

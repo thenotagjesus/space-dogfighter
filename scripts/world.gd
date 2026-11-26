@@ -8,6 +8,7 @@ const Meshes := preload("res://scripts/meshes.gd")
 const Arenas := preload("res://scripts/arenas.gd")
 const Weapons := preload("res://scripts/weapons.gd")
 const FX := preload("res://scripts/fx.gd")
+const HordeScript := preload("res://scripts/horde.gd")
 const COLORS := [Color(0.9,0.2,0.15), Color(0.2,0.5,1.0), Color(0.95,0.8,0.1), Color(0.3,0.9,0.3), Color(0.8,0.3,0.9), Color(1.0,0.5,0.1), Color(0.9,0.9,0.95), Color(0.1,0.9,0.9)]
 
 var arena_id := 0
@@ -24,6 +25,9 @@ var pickups: Array = [] # {pos, node, active, t, w}
 var ready_peers: Array = []
 var hazard_cd := {}
 var _dbg_t := 0.0
+var horde: Node3D = null       # Horde mode manager (top-down arenas only), else null
+var _scores_dirty := false
+var _scores_t := 0.0
 
 func _ready() -> void:
 	cfg = Arenas.build(self, arena_id)
@@ -37,6 +41,10 @@ func _ready() -> void:
 	spawner.spawn_function = _spawn_ship
 	add_child(spawner)
 	spawner.spawn_path = spawner.get_path_to(ships)
+	if Net.mode == 1 and cfg.get("topdown", false):
+		horde = HordeScript.new()
+		horde.name = "Horde"
+		add_child(horde)
 	hud = HudScript.new()
 	hud.world = self
 	add_child(hud)
@@ -58,6 +66,8 @@ func _build_pickups() -> void:
 			var a := rng.randf() * TAU
 			var d := sqrt(rng.randf()) * 480.0
 			pos = Vector3(cos(a) * d, rng.randf_range(cfg["spawn_min"] - 20.0, cfg["spawn_max"]), sin(a) * d)
+			if cfg.get("topdown", false):
+				pos = Vector3(cos(a) * d * 0.6, cfg["plane_y"], sin(a) * d * 0.6)
 		else:
 			pos = Vector3(rng.randf_range(-1,1), rng.randf_range(-1,1), rng.randf_range(-1,1)).normalized() * rng.randf_range(60.0, 420.0)
 		var w := 1 + (i % 6)
@@ -83,10 +93,16 @@ func _process(d: float) -> void:
 		_dbg_t = 0.0
 		var mechs := 0
 		for s in ships.get_children(): if s.mech: mechs += 1
+		if horde: print("[horde] peer=%d %s wave=%d loop=%d lives=%d state=%d enemies=%d queue=%d drops=%d boss=%.2f score=%s" % [multiplayer.get_unique_id(), horde.level_name, horde.wave, horde.loop, horde.lives, horde.state, horde.enemy_list().size(), horde.queue.size(), horde.drops.size(), horde.boss_frac, str(Net.scores.values().map(func(x): return "%s:%d/x%d" % [x["name"], int(x.get("score", 0)), int(x.get("chain", 1))]))])
 		print("[dbg] peer=%d arena=%s ships=%d mechs=%d scores=%s" % [multiplayer.get_unique_id(), cfg["name"], ships.get_child_count(), mechs, str(Net.scores.values().map(func(x): return "%s:%d" % [x["name"], x["frags"]]))])
 
 func _physics_process(d: float) -> void:
 	if not multiplayer.is_server(): return
+	_scores_t -= d
+	if _scores_dirty and _scores_t <= 0.0:
+		_scores_dirty = false
+		_scores_t = 0.25
+		_broadcast_scores()
 	# pickups
 	for i in pickups.size():
 		var p: Dictionary = pickups[i]
@@ -160,17 +176,18 @@ func random_spawn() -> Transform3D:
 func server_begin(bots: int) -> void:
 	Net.scores.clear()
 	if not OS.get_cmdline_user_args().has("--dedicated"):
-		_server_add_ship(1, Net.player_name, false)
+		_server_add_ship(1, Net.player_name, false, Net.loadout)
 	for i in bots:
 		_server_add_ship(1, ["Viper","Kestrel","Nomad","Rook","Havoc","Jinx","Mako","Zed"][i % 8], true)
 
-func _server_add_ship(pid: int, pname: String, bot: bool) -> void:
+func _server_add_ship(pid: int, pname: String, bot: bool, slots: PackedInt32Array = PackedInt32Array()) -> void:
 	var nn := ("Bot%d" % bot_seq) if bot else ("P%d" % pid)
 	if bot: bot_seq += 1
 	if ships.has_node(nn): return
-	var data := {"nn": nn, "pid": pid, "bot": bot, "name": pname, "col": color_seq % COLORS.size(), "xf": random_spawn()}
+	var lo: PackedInt32Array = Weapons.random_loadout() if bot else Weapons.sanitize_loadout(slots)
+	var data := {"nn": nn, "pid": pid, "bot": bot, "name": pname, "col": color_seq % COLORS.size(), "xf": random_spawn(), "loadout": lo}
 	color_seq += 1
-	Net.scores[nn] = {"name": pname + (" [BOT]" if bot else ""), "frags": 0, "deaths": 0}
+	Net.scores[nn] = {"name": pname + (" [BOT]" if bot else ""), "frags": 0, "deaths": 0, "score": 0, "chain": 1}
 	spawner.spawn(data)
 	_broadcast_scores()
 	bc("cl_feed", ["%s joined" % pname])
@@ -181,7 +198,7 @@ func _spawn_ship(data: Variant) -> Node:
 	return s
 
 @rpc("any_peer", "reliable")
-func srv_register(pname: String) -> void:
+func srv_register(pname: String, slots: PackedInt32Array = PackedInt32Array()) -> void:
 	if not multiplayer.is_server(): return
 	var id := multiplayer.get_remote_sender_id()
 	if id in ready_peers: return
@@ -189,7 +206,8 @@ func srv_register(pname: String) -> void:
 	bc("cl_ready", [ready_peers])
 	for i in pickups.size():
 		if not pickups[i]["active"]: rpc_id(id, "cl_pickup", i, false)
-	_server_add_ship(id, str(pname).substr(0, 16), false)
+	_server_add_ship(id, str(pname).substr(0, 16), false, slots)
+	if horde: horde.sync_to(id)
 
 func _on_peer_left(id: int) -> void:
 	ready_peers.erase(id)
@@ -222,13 +240,20 @@ func server_fire(ship: Node3D, w: int) -> void:
 		var hit := get_world_3d().direct_space_state.intersect_ray(q)
 		if not hit.is_empty():
 			to = hit.position
-			if hit.collider.has_method("server_damage"):
+			if hit.collider.has_method("srv_deflecting") and hit.collider.srv_deflecting(Time.get_ticks_msec()):
+				bc("cl_deflect", [String(hit.collider.name)])
+			elif hit.collider.has_method("server_damage"):
 				hit.collider.server_damage(wd["dmg"], String(ship.name), w)
 		bc("cl_beam", [String(ship.name), from, to])
 		return
 	var tgt := ""
 	if w == Weapons.MISSILE:
 		var t = find_lock(ship)
+		if ship.ALL_RANGE and not ship.mech:
+			# all-range charge shot: the server times the hold itself (press arrival to fire arrival) and caps it,
+			# then re-checks range and line of sight now, at fire time
+			var prog: float = ship._srv_take_charge()
+			t = find_lock(ship, lerpf(ship.AR_LOCK_CONE, ship.AR_LOCK_CONE_FULL, prog), lerpf(ship.AR_LOCK_RANGE, ship.AR_LOCK_RANGE_FULL, prog), true)
 		if t: tgt = String(t.name)
 	var n: int = wd["count"]
 	for i in n:
@@ -248,21 +273,50 @@ func server_fire(ship: Node3D, w: int) -> void:
 		if wd["proj"] == 4:
 			vel = ship.est_vel * 0.7 - b.y * 6.0
 			extra = Vector3(0, -22.0, 0) if cfg["planet"] else -b.y * 14.0
+			if cfg.get("topdown", false):
+				# top-down: the bomb is a proximity mine that drifts to a stop on the play plane
+				o.y = cfg["plane_y"]
+				vel = Vector3(ship.est_vel.x, 0.0, ship.est_vel.z) * 0.5
+				extra = Vector3.ZERO
 		bc("cl_proj", [w, o, vel, String(ship.name), tgt, extra])
 
-func find_lock(ship: Node3D) -> Node3D:
+func find_lock(ship: Node3D, cone_deg := 20.0, rng := 450.0, los := false) -> Node3D:
 	var best: Node3D = null
-	var best_dot := cos(deg_to_rad(20.0))
+	var best_dot := cos(deg_to_rad(cone_deg))
 	var fwd: Vector3 = -ship.global_transform.basis.z
-	for s in ships.get_children():
-		if s == ship or not s.alive: continue
+	for s in lock_candidates(ship):
 		var to: Vector3 = s.global_position - ship.global_position
-		if to.length() > 450.0: continue
+		if to.length() > rng: continue
 		var dt := to.normalized().dot(fwd)
 		if dt > best_dot:
+			if los and not get_world_3d().direct_space_state.intersect_ray(PhysicsRayQueryParameters3D.create(ship.global_position, s.global_position, 1)).is_empty():
+				continue   # terrain or a station in the way
 			best_dot = dt
 			best = s
 	return best
+
+## Lock / bot-target candidates: other live pilots in Dogfight, live horde enemies in Horde (co-op).
+func lock_candidates(ship: Node3D) -> Array:
+	if horde: return horde.enemy_list()
+	var out: Array = []
+	for s in ships.get_children():
+		if s != ship and s.alive: out.append(s)
+	return out
+
+## Nearest live pilot to pos within max_d (horde AI targeting), or null.
+func find_ship_near(pos: Vector3, max_d: float) -> Node3D:
+	var best: Node3D = null
+	var bd := max_d
+	for s in ships.get_children():
+		if not s.alive: continue
+		var dd: float = s.global_position.distance_to(pos)
+		if dd < bd:
+			bd = dd
+			best = s
+	return best
+
+func mark_scores_dirty() -> void:
+	_scores_dirty = true
 
 @rpc("authority", "reliable")
 func cl_proj(w: int, origin: Vector3, vel: Vector3, shooter_nn: String, tgt_nn: String, extra: Vector3) -> void:
@@ -272,7 +326,9 @@ func cl_proj(w: int, origin: Vector3, vel: Vector3, shooter_nn: String, tgt_nn: 
 	p.auth = multiplayer.is_server()
 	p.shooter_nn = shooter_nn
 	p.shooter = ships.get_node_or_null(shooter_nn)
-	if tgt_nn != "": p.target = ships.get_node_or_null(tgt_nn)
+	if tgt_nn != "":
+		p.target = ships.get_node_or_null(tgt_nn)
+		if p.target == null and horde: p.target = horde.get_node_or_null(tgt_nn)
 	p.vel = vel
 	p.extra = extra
 	p.position = origin
@@ -294,6 +350,12 @@ func server_proj_hit(p: Node, collider: Object, pos: Vector3) -> void:
 	if wd.has("splash"):
 		server_explode(pos, p.shooter_nn, wd["dmg"], wd["splash"], p.w)
 	else:
+		if collider and collider.has_method("srv_deflecting") and collider.srv_deflecting(Time.get_ticks_msec()):
+			# barrel-roll deflect (server decides): no damage, the shot bounces back owned by the deflector
+			bc("cl_deflect", [String(collider.name)])
+			if OS.get_cmdline_user_args().has("--debug-net"): print("[net] deflect ", collider.name)
+			bc("cl_proj", [p.w, pos, -p.vel * 0.8, String(collider.name), "", Vector3.ZERO])
+			return
 		if collider and collider.has_method("server_damage"):
 			collider.server_damage(wd["dmg"], p.shooter_nn, p.w)
 		bc("cl_fx", [0, pos, 1.0])
@@ -306,13 +368,23 @@ func server_explode(pos: Vector3, shooter_nn: String, dmg: float, radius: float,
 			var dd := lerpf(dmg, dmg * 0.25, dist / radius)
 			if String(s.name) == shooter_nn: dd *= 0.4
 			s.server_damage(dd, shooter_nn, w)
+	if horde and not shooter_nn.begins_with("#"):
+		for e in horde.enemy_list():
+			var de: float = e.global_position.distance_to(pos) - e.r
+			if de < radius:
+				e.server_damage(lerpf(dmg, dmg * 0.25, clampf(de / radius, 0.0, 1.0)), shooter_nn, w)
 	bc("cl_fx", [1, pos, radius / 12.0])
 
 func server_frag(killer_nn: String, victim: Node3D, cause := "") -> void:
 	var vn := String(victim.name)
 	if Net.scores.has(vn): Net.scores[vn]["deaths"] += 1
 	var text := ""
-	if cause != "" and not Net.scores.has(killer_nn):
+	if horde:
+		# co-op: no frag penalties; every pilot loss costs the team a life
+		if killer_nn == "#horde" and cause == "": cause = "was shot down by the horde"
+		text = "%s %s" % [victim.pilot_name, cause if cause != "" else "went down"]
+		horde.on_player_down(vn)
+	elif cause != "" and not Net.scores.has(killer_nn):
 		text = "%s %s" % [victim.pilot_name, cause]
 	elif killer_nn == vn or not Net.scores.has(killer_nn):
 		if Net.scores.has(vn): Net.scores[vn]["frags"] -= 1
@@ -331,11 +403,36 @@ func _broadcast_scores() -> void:
 func cl_fx(kind: int, pos: Vector3, size: float) -> void:
 	if kind == 0:
 		FX.spark(self, pos)
+	elif kind == 2:
+		FX.clash(self, pos)
+		if local_ship:
+			var d2 := local_ship.global_position.distance_to(pos)
+			local_ship.add_shake(clamp((1.0 - d2 / 80.0) * 0.4, 0.0, 0.8))
 	else:
 		FX.explosion(self, pos, size)
 		if local_ship:
 			var dist := local_ship.global_position.distance_to(pos)
 			local_ship.add_shake(clamp((1.0 - dist / (60.0 * size)) * 0.5 * size, 0.0, 1.0))
+
+@rpc("authority", "reliable")
+func cl_blade(nn: String, phase: int, extra: String) -> void:
+	var sh := ships.get_node_or_null(nn)
+	if sh and sh.has_method("apply_blade_event"):
+		sh.apply_blade_event(phase, extra)
+
+@rpc("authority", "unreliable")
+func cl_dodge(nn: String) -> void:
+	var s := ships.get_node_or_null(nn)
+	if s:
+		s.dodge_flash = 1.0
+		FX.spark(self, s.global_position)
+
+@rpc("authority", "reliable")
+func cl_deflect(nn: String) -> void:
+	var s := ships.get_node_or_null(nn)
+	if s:
+		s.deflect_flash = 1.0
+		FX.spark(self, s.global_position)
 
 @rpc("authority", "reliable")
 func cl_scores(s: Dictionary) -> void:

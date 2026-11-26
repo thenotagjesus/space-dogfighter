@@ -3,6 +3,7 @@ config_version=5
 
 [application]
 config/name="Space Dogfighter"
+config/version="0.4.0"
 config/description="90s low-poly boomer shooter in space"
 run/main_scene="res://main.tscn"
 config/features=PackedStringArray("4.7", "GL Compatibility")
@@ -147,6 +148,10 @@ camera_toggle={
 drift={
 "deadzone": 0.2,
 "events": [Object(InputEventJoypadButton,"device":-1,"button_index":0), Object(InputEventKey,"device":-1,"physical_keycode":4194325)]
+}
+melee={
+"deadzone": 0.2,
+"events": [Object(InputEventJoypadButton,"device":-1,"button_index":1), Object(InputEventKey,"device":-1,"physical_keycode":66)]
 }
 
 [physics]

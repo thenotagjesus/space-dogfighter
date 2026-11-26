@@ -2,6 +2,8 @@ extends Node
 ## Main menu + session bootstrap (Solo / Host / Join).
 const WorldScript := preload("res://scripts/world.gd")
 const Arenas := preload("res://scripts/arenas.gd")
+const HangarScript := preload("res://scripts/hangar.gd")
+const Weapons := preload("res://scripts/weapons.gd")
 
 var world: Node3D = null
 var menu: Control
@@ -11,6 +13,7 @@ var port_edit: LineEdit
 var bots_spin: SpinBox
 var invert_chk: CheckBox
 var arena_opt: OptionButton
+var mode_opt: OptionButton
 var overlay: CanvasLayer
 var opt_title: Label
 var opt_checks := {}
@@ -19,10 +22,20 @@ var view_opt: OptionButton
 var resume_btn: Button
 var leave_btn: Button
 var status_lbl: Label
+var hangar: CanvasLayer
+var credits: CanvasLayer
+var credits_text: TextEdit
+var _pending_start := ""
+var _credits_back: Button
 
 func _ready() -> void:
 	_build_menu()
 	_build_overlay()
+	_build_hangar()
+	_build_credits()
+	_focus_menu()
+	if DisplayServer.get_name() == "headless":
+		Net.skip_hangar = true
 	multiplayer.connected_to_server.connect(_on_connected)
 	multiplayer.connection_failed.connect(_on_conn_failed)
 	multiplayer.server_disconnected.connect(_on_server_gone)
@@ -32,6 +45,8 @@ func _ready() -> void:
 			bots_spin.value = int(a.substr(7))
 		elif a.begins_with("--arena="):
 			arena_opt.select(clampi(int(a.substr(8)), 0, Arenas.NAMES.size() - 1))
+		elif a.begins_with("--mode="):
+			mode_opt.select(1 if a.substr(7) in ["horde", "1"] else 0)
 		elif a.begins_with("--view="):
 			Net.view = clampi(int(a.substr(7)), 0, 1)
 		elif a.begins_with("--video="):
@@ -44,6 +59,12 @@ func _ready() -> void:
 			get_tree().create_timer(3.0).timeout.connect(func(): opt_checks["inv_yaw"].button_pressed = true; close_overlay(); print("[ui] overlay closed, inv_yaw=", Net.inv_yaw))
 		elif a.begins_with("--name="):
 			name_edit.text = a.substr(7)
+		elif a.begins_with("--port="):
+			port_edit.text = a.substr(7)
+		elif a.begins_with("--loadout="):
+			Net.loadout = Weapons.parse_loadout_string(a.substr(10))
+			Net.skip_hangar = true
+			print("[loadout] ", Net.loadout)
 	for a in args:
 		if a == "--solo":
 			_start_solo()
@@ -69,7 +90,7 @@ func _build_menu() -> void:
 	box.add_theme_constant_override("separation", 2)
 	cc.add_child(box)
 	var title := Label.new()
-	title.text = "SPACE DOGFIGHTER"
+	title.text = "SPACE DOGFIGHTER  " + Net.VERSION
 	title.add_theme_font_size_override("font_size", 22)
 	title.add_theme_color_override("font_color", Color(1, 0.6, 0.1))
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -92,10 +113,20 @@ func _build_menu() -> void:
 	arena_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	ab.add_child(arena_opt)
 	box.add_child(ab)
-	for pair in [["SOLO VS BOTS", _start_solo], ["HOST GAME", _start_host], ["JOIN GAME", _start_join], ["OPTIONS", func(): open_overlay(false)], ["QUIT", func(): get_tree().quit()]]:
+	var mb := HBoxContainer.new()
+	var ml := Label.new(); ml.text = "Mode (host/solo)"; _small(ml); mb.add_child(ml)
+	mode_opt = OptionButton.new(); _small(mode_opt)
+	for n in Net.MODE_NAMES: mode_opt.add_item(n)
+	mode_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	mode_opt.tooltip_text = "Horde: co-op waves, score chains, drops and a boss on the top-down arenas"
+	mode_opt.item_selected.connect(func(i): if i == 1 and arena_opt.selected < Arenas.FIRST_TOPDOWN: arena_opt.select(Arenas.FIRST_TOPDOWN))
+	mb.add_child(mode_opt)
+	box.add_child(mb)
+	for pair in [["SOLO VS BOTS", _start_solo], ["HOST GAME", _start_host], ["JOIN GAME", _start_join], ["OPTIONS", func(): open_overlay(false)], ["CREDITS", _open_credits], ["QUIT", func(): get_tree().quit()]]:
 		var b := Button.new(); b.text = pair[0]; _small(b)
 		b.pressed.connect(pair[1])
 		box.add_child(b)
+		if _first_menu_btn == null: _first_menu_btn = b
 	status_lbl = Label.new(); _small(status_lbl); status_lbl.text = "Gamepad or mouse+keyboard. Esc = release mouse / leave."
 	status_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD
 	box.add_child(status_lbl)
@@ -154,9 +185,12 @@ func _build_overlay() -> void:
 		cb.toggled.connect(func(on): Net.set(key, on); Net.save_settings(); Net.apply_video())
 		box.add_child(cb)
 		opt_checks[key] = cb
-	var note := Label.new(); note.text = "Applies to gamepad and mouse. Saved automatically."; _small(note)
+	var note := Label.new(); note.text = "Applies to gamepad and mouse. Saved automatically. Weapon loadout is chosen in the Hangar before each match."; _small(note)
 	note.add_theme_font_size_override("font_size", 8)
 	box.add_child(note)
+	var cred := Button.new(); cred.text = "CREDITS / LICENCES"; _small(cred)
+	cred.pressed.connect(_open_credits)
+	box.add_child(cred)
 	resume_btn = Button.new(); _small(resume_btn)
 	resume_btn.pressed.connect(close_overlay)
 	box.add_child(resume_btn)
@@ -203,11 +237,113 @@ func _field(parent: Control, label: String, val: String) -> LineEdit:
 	parent.add_child(hb)
 	return e
 
+func _build_hangar() -> void:
+	hangar = HangarScript.new()
+	add_child(hangar)
+
+func _build_credits() -> void:
+	credits = CanvasLayer.new()
+	credits.layer = 25
+	var root := Control.new()
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	credits.add_child(root)
+	var dim := ColorRect.new()
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dim.color = Color(0, 0, 0, 0.88)
+	root.add_child(dim)
+	var box := VBoxContainer.new()
+	box.set_anchors_preset(Control.PRESET_FULL_RECT)
+	box.offset_left = 16
+	box.offset_right = -16
+	box.offset_top = 8
+	box.offset_bottom = -8
+	root.add_child(box)
+	var t := Label.new()
+	t.text = "CREDITS"
+	t.add_theme_font_size_override("font_size", 16)
+	t.add_theme_color_override("font_color", Color(1, 0.6, 0.1))
+	t.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(t)
+	credits_text = TextEdit.new()
+	credits_text.editable = false
+	credits_text.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	credits_text.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	credits_text.add_theme_font_size_override("font_size", 10)
+	box.add_child(credits_text)
+	var back := Button.new()
+	back.text = "BACK"
+	_small(back)
+	back.pressed.connect(_close_credits)
+	_credits_back = back
+	box.add_child(back)
+	credits.hide()
+	add_child(credits)
+
+func _credits_body() -> String:
+	var body := "SPACE DOGFIGHTER  %s\n\n" % Net.VERSION
+	body += "This game is released under the MIT licence. See LICENSE in the release folder.\n\n"
+	body += "Made with Godot Engine\n"
+	body += "Godot Engine is copyright (c) 2014-present Godot Engine contributors, and (c) 2007-2014 Juan Linietsky, Ariel Manzur. It is used under the MIT licence. The full engine licence and third-party notices are bundled with this build as GODOT_LICENSE.txt and GODOT_COPYRIGHT.txt, and are also shown below from the engine itself.\n\n"
+	body += "======= Engine licence (Engine.get_license_text) =======\n"
+	body += Engine.get_license_text() + "\n\n"
+	body += "======= Third-party notices (Engine.get_copyright_info) =======\n"
+	for block in Engine.get_copyright_info():
+		body += str(block.get("name", "")) + "\n"
+		for part in block.get("parts", []):
+			for c in part.get("copyright", []):
+				body += "  (c) %s\n" % str(c)
+			if part.get("license", "") != "":
+				body += "  License: %s\n" % str(part.get("license", ""))
+		body += "\n"
+	return body
+
+func _open_credits() -> void:
+	credits_text.text = _credits_body()
+	credits.show()
+	Net.ui_open = true
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	_credits_back.call_deferred("grab_focus")
+
+func _close_credits() -> void:
+	credits.hide()
+	if overlay and overlay.visible:
+		resume_btn.grab_focus()
+		return
+	_focus_menu()
+	Net.ui_open = menu.visible
+	if world:
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+
+func _with_hangar(action: String) -> void:
+	_pending_start = action
+	if Net.skip_hangar or DisplayServer.get_name() == "headless":
+		_run_pending_start()
+		return
+	hangar.open(_run_pending_start, _hangar_back)
+
+func _hangar_back() -> void:
+	_pending_start = ""
+	menu.show()
+	_focus_menu()
+	Net.ui_open = false
+	status_lbl.text = "Gamepad or mouse+keyboard. Esc = release mouse / leave."
+
+func _run_pending_start() -> void:
+	var a := _pending_start
+	_pending_start = ""
+	match a:
+		"solo": _do_solo()
+		"host": _do_host()
+		"join": _do_join()
+
 func _apply_settings() -> void:
 	Net.player_name = name_edit.text.strip_edges().substr(0, 16)
 	if Net.player_name == "": Net.player_name = "Pilot"
 	Net.bot_count = int(bots_spin.value)
 	Net.arena = arena_opt.selected
+	Net.mode = mode_opt.selected
+	if Net.mode == 1 and Net.arena < Arenas.FIRST_TOPDOWN:
+		Net.arena = Arenas.FIRST_TOPDOWN   # Horde runs on the top-down arenas only
 
 func _start_world() -> void:
 	if world: return
@@ -219,16 +355,23 @@ func _start_world() -> void:
 
 func _start_solo() -> void:
 	_apply_settings()
+	_with_hangar("solo")
+
+func _do_solo() -> void:
 	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
 	_start_world()
 	world.server_begin(max(1, Net.bot_count))
 
 func _start_host() -> void:
 	_apply_settings()
+	_with_hangar("host")
+
+func _do_host() -> void:
 	var peer := ENetMultiplayerPeer.new()
 	var err := peer.create_server(int(port_edit.text), 16)
 	if err != OK:
 		status_lbl.text = "Host failed (err %d) - port in use?" % err
+		menu.show()
 		return
 	multiplayer.multiplayer_peer = peer
 	print("[net] hosting on UDP ", port_edit.text)
@@ -237,10 +380,14 @@ func _start_host() -> void:
 
 func _start_join() -> void:
 	_apply_settings()
+	_with_hangar("join")
+
+func _do_join() -> void:
 	var peer := ENetMultiplayerPeer.new()
 	var err := peer.create_client(ip_edit.text.strip_edges(), int(port_edit.text))
 	if err != OK:
 		status_lbl.text = "Join failed (err %d)" % err
+		menu.show()
 		return
 	multiplayer.multiplayer_peer = peer
 	status_lbl.text = "Connecting..."
@@ -253,14 +400,15 @@ func _on_connected() -> void:
 @rpc("any_peer", "call_remote", "reliable")
 func srv_hello() -> void:
 	if multiplayer.is_server():
-		rpc_id(multiplayer.get_remote_sender_id(), "cl_welcome", Net.arena)
+		rpc_id(multiplayer.get_remote_sender_id(), "cl_welcome", Net.arena, Net.mode)
 
 @rpc("authority", "call_remote", "reliable")
-func cl_welcome(arena: int) -> void:
+func cl_welcome(arena: int, mode: int = 0) -> void:
 	Net.arena = clampi(arena, 0, Arenas.NAMES.size() - 1)
-	print("[net] server arena: ", Arenas.NAMES[Net.arena])
+	Net.mode = clampi(mode, 0, Net.MODE_NAMES.size() - 1)
+	print("[net] server arena: ", Arenas.NAMES[Net.arena], "  mode: ", Net.MODE_NAMES[Net.mode])
 	_start_world()
-	world.rpc_id(1, "srv_register", Net.player_name)
+	world.rpc_id(1, "srv_register", Net.player_name, Net.loadout)
 
 func _on_conn_failed() -> void:
 	leave_game("Connection failed.")
@@ -280,9 +428,24 @@ func leave_game(msg := "") -> void:
 	overlay.hide()
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	menu.show()
+	_focus_menu()
 	if msg != "": status_lbl.text = msg
 
+var _first_menu_btn: Button
+
+## Pads navigate by focus: something on screen must always hold it.
+func _focus_menu() -> void:
+	if _first_menu_btn and menu.visible:
+		_first_menu_btn.call_deferred("grab_focus")
+
 func _unhandled_input(event: InputEvent) -> void:
+	if credits.visible and (event.is_action_pressed("ui_cancel") or event.is_action_pressed("menu")):
+		_close_credits()
+		get_viewport().set_input_as_handled()
+		return
+	# a pad press while nothing is focused (e.g. after a mouse click) re-grabs menu focus
+	if menu.visible and world == null and (event is InputEventJoypadButton or event is InputEventJoypadMotion) and get_viewport().gui_get_focus_owner() == null:
+		_focus_menu()
 	if event.is_action_pressed("menu"):
 		if overlay.visible: close_overlay()
 		elif world: open_overlay(true)

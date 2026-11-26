@@ -184,3 +184,80 @@ static func beam(parent: Node, a: Vector3, b: Vector3, col: Color) -> void:
 	root.get_tree().create_timer(0.2).timeout.connect(root.queue_free)
 	spark(parent, b)
 
+
+
+## Procedural 16-bit mono WAVs (no third-party samples) plus a blade-clash burst.
+static var _snd: Dictionary = {}
+
+static func sound(kind: String) -> AudioStreamWAV:
+	if _snd.has(kind):
+		return _snd[kind]
+	var stream: AudioStreamWAV
+	match kind:
+		"windup":
+			stream = _wav(0.32, func(t: float) -> float:
+				var f := lerpf(180.0, 820.0, t / 0.32)
+				var hum := sin(t * f * TAU) * 0.35 + sin(t * f * 2.02 * TAU) * 0.12
+				var shimmer := sin(t * 2400.0 * TAU) * t * 0.08
+				return hum + shimmer)
+		"slash":
+			stream = _wav(0.16, func(t: float) -> float:
+				var f := lerpf(1400.0, 220.0, t / 0.16)
+				return sin(t * f * TAU) * 0.25 + (randf() * 2.0 - 1.0) * (1.0 - t / 0.16) * 0.35)
+		"clash":
+			stream = _wav(0.22, func(t: float) -> float:
+				var n := (randf() * 2.0 - 1.0) * exp(-t * 18.0) * 0.55
+				var a := sin(t * 880.0 * TAU) * exp(-t * 10.0) * 0.3
+				var b := sin(t * 1327.0 * TAU) * exp(-t * 14.0) * 0.25
+				var c := sin(t * 1911.0 * TAU) * exp(-t * 16.0) * 0.15
+				return n + a + b + c)
+		"whiff":
+			stream = _wav(0.12, func(t: float) -> float:
+				return sin(t * 110.0 * TAU) * exp(-t * 22.0) * 0.5 + (randf() * 2.0 - 1.0) * exp(-t * 30.0) * 0.15)
+		_:
+			stream = _wav(0.05, func(t: float) -> float: return 0.0)
+	_snd[kind] = stream
+	return stream
+
+static func _wav(len_s: float, fn: Callable, rate := 22050) -> AudioStreamWAV:
+	var n := int(len_s * rate)
+	var data := PackedByteArray()
+	data.resize(n * 2)
+	var fade := int(rate * 0.008)
+	for i in n:
+		var t := float(i) / rate
+		var env := 1.0
+		if i < fade:
+			env = float(i) / float(max(1, fade))
+		var tail := n - 1 - i
+		if tail < fade * 3:
+			env *= float(tail) / float(max(1, fade * 3))
+		var v := int(clampf(fn.call(t) * env, -1.0, 1.0) * 32767.0)
+		data[i * 2] = v & 0xFF
+		data[i * 2 + 1] = (v >> 8) & 0xFF
+	var s := AudioStreamWAV.new()
+	s.format = AudioStreamWAV.FORMAT_16_BITS
+	s.mix_rate = rate
+	s.stereo = false
+	s.data = data
+	return s
+
+static func clash(parent: Node, pos: Vector3) -> void:
+	spark(parent, pos)
+	spark(parent, pos + Vector3(0.4, 0.3, 0))
+	var root := Node3D.new()
+	parent.add_child(root)
+	root.global_position = pos
+	var mi := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radial_segments = 6
+	sm.rings = 3
+	mi.mesh = sm
+	var mat := _glow_mat(Color(1.6, 1.6, 2.0))
+	mi.material_override = mat
+	mi.scale = Vector3.ONE * 0.4
+	root.add_child(mi)
+	var tw := root.create_tween()
+	tw.tween_property(mi, "scale", Vector3.ONE * 3.2, 0.08)
+	tw.parallel().tween_property(mat, "albedo_color:a", 0.0, 0.16)
+	root.get_tree().create_timer(0.2).timeout.connect(root.queue_free)

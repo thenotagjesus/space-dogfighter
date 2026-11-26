@@ -4,6 +4,9 @@ extends Node3D
 const Meshes := preload("res://scripts/meshes.gd")
 const Weapons := preload("res://scripts/weapons.gd")
 
+const HOME_K := 4.5          # 1/s proportional pull toward the target
+const HOME_TURN_MAX := 3.0   # rad/s cap (172 deg/s): about a 43 m radius at 130 m/s
+
 var w := 0
 var kind := 0
 var vel := Vector3.ZERO
@@ -87,8 +90,17 @@ func _physics_process(d: float) -> void:
 	match kind:
 		1:
 			if target and is_instance_valid(target) and target.alive:
-				var want := (target.global_position - global_position).normalized() * vel.length()
-				vel = vel.lerp(want, clamp(2.4 * d, 0.0, 1.0))
+				# turn-rate-limited pursuit: proportional pull, capped at HOME_TURN_MAX rad/s (frame-rate safe)
+				var spd := vel.length()
+				var cur := vel / maxf(spd, 0.001)
+				var tdir := (target.global_position - global_position).normalized()
+				var a := cur.angle_to(tdir)
+				if a > 0.0001:
+					var step := minf(a * (1.0 - exp(-HOME_K * d)), HOME_TURN_MAX * d)
+					var axis := cur.cross(tdir)
+					if axis.length_squared() < 0.000001:
+						axis = Vector3.UP
+					vel = vel.rotated(axis.normalized(), step)
 				_face()
 			to = global_position + vel * d
 		2:
@@ -104,8 +116,10 @@ func _physics_process(d: float) -> void:
 			var armed := age > 0.7
 			if light: light.light_energy = 3.0 if (armed and int(age * 8.0) % 2 == 0) else 0.6
 			if auth and armed:
-				for s in world.ships.get_children():
-					if s.alive and String(s.name) != shooter_nn and s.global_position.distance_to(global_position) < 11.0:
+				var near: Array = world.ships.get_children()
+				if world.horde: near = world.horde.enemy_list()   # co-op: mines only trigger on the horde
+				for s in near:
+					if s.alive and String(s.name) != shooter_nn and s.global_position.distance_to(global_position) < 11.0 + (s.r if world.horde else 0.0):
 						_end()
 						return
 		_:
